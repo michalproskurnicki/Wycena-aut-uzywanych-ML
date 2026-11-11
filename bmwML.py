@@ -1,19 +1,16 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import re
 from catboost import CatBoostRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_percentage_error, r2_score, mean_absolute_error
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, mean_absolute_error, r2_score
 from sklearn.ensemble import IsolationForest
-import matplotlib.pyplot as plt
-import seaborn as sns
-import shap
 
-# 1. Wczytanie i przygotowanie danych
+# ==============================================================================
+# 1. WCZYTANIE I WSTĘPNE CZYSZCZENIE DANYCH
+# ==============================================================================
 file_path = 'C:/Users/PC/Desktop/bmw/dane_finalne.xlsx'  
 df = pd.read_excel(file_path, dtype=str)
-
-print(f"Początkowa liczba wierszy w pliku: {len(df)}")
 df.columns = df.columns.str.strip()
 
 def clean_hard(x):
@@ -25,206 +22,134 @@ for col in cols_to_clean:
     df[col] = pd.to_numeric(df[col].apply(clean_hard), errors='coerce')
 
 df = df.dropna(subset=['Cena', 'Moc', 'Pojemność', 'Rocznik', 'Przebieg'])
-df = df[(df['Cena'] >= 90000) & (df['Cena'] <= 500000)]
+df = df[(df['Cena'] >= 90000) & (df['Cena'] <= 1000000)]
 df = df[(df['Moc'] > 50)]
 
 mask_nowe = df['Stan'].astype(str).str.strip().str.lower().isin(['nowe', 'nowy'])
 df = df[(df['Przebieg'] > 1000) | ((df['Przebieg'] <= 1000) & mask_nowe)]
 
-# --- INŻYNIERIA CECH ---
-AKTUALNY_ROK = datetime.now().year
+identyfikatory_auta = ['Cena', 'Moc', 'Pojemność', 'Rocznik', 'Przebieg', 'Seria/Model']
+df = df.drop_duplicates(subset=identyfikatory_auta).reset_index(drop=True)
+
+# ==============================================================================
+# 2. INŻYNIERIA CECH BEZWZGLĘDNYCH
+# ==============================================================================
+AKTUALNY_ROK = 2026
 df['Wiek'] = AKTUALNY_ROK - df['Rocznik']
 df['Przebieg_Roczny'] = df['Przebieg'] / (df['Wiek'] + 0.5)
 df['Moc_Z_Pojemnosci'] = df['Moc'] / (df['Pojemność'] + 1)
 
-df['Seria_Main'] = df['Seria/Model'].apply(lambda x: str(x).split(' ')[0] if pd.notna(x) else 'Brak')
-df['Is_M_Power'] = df['Seria/Model'].apply(lambda x: 1 if 'M' in str(x).split(' ')[0] else 0)
+def parse_seria_main(val):
+    if pd.isna(val) or val == 'Brak danych': return 'Brak'
+    val_str = str(val).strip()
+    if val_str.lower().startswith('seria'):
+        parts = val_str.split(' ')
+        return ' '.join(parts[:2]) if len(parts) >= 2 else parts[0]
+    match = re.match(r'^([A-Za-z]\d|\d{3}|M\d?)', val_str, re.IGNORECASE)
+    return match.group(0).upper() if match else val_str.split(' ')[0]
 
-# Odcięcie skrajnych anomalii cenowych (2% - 98%)
-q_low = df['Cena'].quantile(0.02)
-q_high = df['Cena'].quantile(0.98)
-df = df[(df['Cena'] >= q_low) & (df['Cena'] <= q_high)]
+def parse_is_m_power(val):
+    if pd.isna(val): return 0
+    pattern = r'(^M\d{1,2}\b)|(\bM\b)|(^M\d{3})'
+    return 1 if re.search(pattern, str(val).strip(), re.IGNORECASE) else 0
+
+df['Seria_Main'] = df['Seria/Model'].apply(parse_seria_main)
+df['Is_M_Power'] = df['Seria/Model'].apply(parse_is_m_power)
+df['Is_xDrive'] = df['Seria/Model'].astype(str).str.contains('xDrive', case=False).astype(int)
+df['Is_Electric_Hybrid'] = df['Typ paliwa'].astype(str).str.contains('hybryda|elektryczny', case=False).astype(int)
 
 cols_cat = ['Typ sprzedawcy', 'Kraj pochodzenia', 'Typ skrzyni', 'Typ nadwozia', 'Typ paliwa', 'Generacja', 'Seria/Model', 'Stan', 'Seria_Main']
 for col in cols_cat:
     df[col] = df[col].fillna('Brak danych').astype(str)
 
-identyfikatory_auta = ['Cena', 'Moc', 'Pojemność', 'Rocznik', 'Przebieg', 'Seria/Model']
-df = df.drop_duplicates(subset=identyfikatory_auta)
-
-# Flagowanie anomalii
-print("[INFO] Uruchamiam Isolation Forest w celu oflagowania wewnętrznych outlierów...")
-features_for_anomaly = ['Wiek', 'Moc', 'Pojemność', 'Przebieg', 'Przebieg_Roczny', 'Moc_Z_Pojemnosci']
-iso_forest = IsolationForest(contamination=0.03, random_state=42)
-anomaly_preds = iso_forest.fit_predict(df[features_for_anomaly])
-df['Is_Anomaly'] = np.where(anomaly_preds == -1, 1, 0)
-
-features = ['Typ sprzedawcy', 'Kraj pochodzenia', 'Typ skrzyni', 'Typ nadwozia', 'Typ paliwa', 'Generacja', 'Seria/Model', 'Stan', 'Seria_Main', 'Wiek', 'Moc', 'Pojemność', 'Przebieg', 'Is_M_Power', 'Przebieg_Roczny', 'Moc_Z_Pojemnosci', 'Is_Anomaly']
+features_base = [
+    'Typ sprzedawcy', 'Kraj pochodzenia', 'Typ skrzyni', 'Typ nadwozia', 
+    'Typ paliwa', 'Generacja', 'Seria/Model', 'Stan', 'Seria_Main', 
+    'Wiek', 'Rocznik', 'Moc', 'Pojemność', 'Przebieg', 'Is_M_Power', 
+    'Is_xDrive', 'Is_Electric_Hybrid', 'Przebieg_Roczny', 'Moc_Z_Pojemnosci'
+]
 cat_features = cols_cat
 
-X = df[features]
-y_log = np.log(df['Cena']) 
-
-# Podział na zbiór treningowy i ostateczny testowy
-X_train, X_test, y_train_log, y_test_log = train_test_split(X, y_log, test_size=0.2, random_state=42)
-
-
-# TRENING MODELU 
-
-print("\nTrenuję model CatBoost...")
-best_params = {
-    'iterations': 1200,
-    'depth': 6,
-    'learning_rate': 0.04,
-    'l2_leaf_reg': 3.5,
-    'loss_function': 'RMSE',
-    'logging_level': 'Silent',
-    'random_seed': 42
-}
-model = CatBoostRegressor(**best_params, cat_features=cat_features)
-model.fit(X_train, y_train_log)
-
-
-# EWALUACJA MODELU NA ZBIORZE TESTOWYM (R2, MAPE, BŁĘDY W PROCENTACH)
-
-y_test_real = np.exp(y_test_log)
-y_pred_real = np.exp(model.predict(X_test))
-
-r2 = r2_score(y_test_real, y_pred_real)
-mape = mean_absolute_percentage_error(y_test_real, y_pred_real)
-mae = mean_absolute_error(y_test_real, y_pred_real)
-
-print("\n" + "="*50)
-print("--- METRYKI EWALUACJI MODELU (ZBIÓR TESTOWY) ---")
-print(f"R² Score: {r2:.4f}")
-print(f"MAPE:     {mape * 100:.2f}%")
-print(f"MAE:      {mae:,.2f} PLN")
-print("="*50)
-
-# Rozkład dokładności predykcji (błąd względny)
-abs_percentage_errors = np.abs((y_test_real - y_pred_real) / y_test_real) * 100
-
-within_5 = np.mean(abs_percentage_errors <= 5) * 100
-within_10 = np.mean(abs_percentage_errors <= 10) * 100
-within_15 = np.mean(abs_percentage_errors <= 15) * 100
-within_20 = np.mean(abs_percentage_errors <= 20) * 100
-within_30 = np.mean(abs_percentage_errors <= 30) * 100
-within_50 = np.mean(abs_percentage_errors <= 50) * 100
-
-print("\n--- STRUKTURA BŁĘDÓW PREDYKCJI MODELU ---")
-print(f"Predykcje z błędem <=  5%: {within_5:.2f}% aut")
-print(f"Predykcje z błędem <= 10%: {within_10:.2f}% aut")
-print(f"Predykcje z błędem <= 15%: {within_15:.2f}% aut")
-print(f"Predykcje z błędem <= 20%: {within_20:.2f}% aut")
-print(f"Predykcje z błędem <= 30%: {within_30:.2f}% aut")
-print(f"Predykcje z błędem <= 50%: {within_50:.2f}% aut")
-print("="*50 + "\n")
+X = df[features_base].copy()
+y = df['Cena'].values
+y_log = np.log(y)
 
 # ==============================================================================
-# WIZUALIZACJA: FEATURE IMPORTANCE & SHAP
+# 3. WALIDACJA KRZYŻOWA (5-FOLD CV) - CATBOOST
 # ==============================================================================
-# 1. Feature Importance (CatBoost)
-feature_importances = model.get_feature_importance()
-fi_df = pd.DataFrame({'Feature': features, 'Importance': feature_importances}).sort_values(by='Importance', ascending=False)
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+features_for_anomaly = ['Wiek', 'Moc', 'Pojemność', 'Przebieg', 'Przebieg_Roczny', 'Moc_Z_Pojemnosci']
 
-plt.figure(figsize=(10, 6))
-sns.barplot(x='Importance', y='Feature', data=fi_df, palette='viridis')
-plt.title('CatBoost Feature Importance')
-plt.xlabel('Waga zmiennej (%)')
-plt.ylabel('Cecha')
-plt.tight_layout()
-plt.savefig('bmw_feature_importance.png', bbox_inches='tight', dpi=300)
-plt.show()
+metrics = {'Train_MAPE': [], 'Val_MAPE': [], 'Train_R2': [], 'Val_R2': [], 'Val_MAE': [], 'Val_RMSE': []}
 
-# 2. SHAP Values
-explainer = shap.TreeExplainer(model)
-shap_values = explainer(X_test)
+print("==================================================")
+print("  URUCHAMIAM WALIDACJĘ KRZYŻOWĄ: CATBOOST REGRESSOR")
+print("==================================================")
 
-plt.figure(figsize=(10, 6))
-shap.summary_plot(shap_values, X_test, show=False)
-plt.title('SHAP Summary Plot', fontsize=14)
-plt.tight_layout()
-plt.savefig('bmw_shap_summary.png', bbox_inches='tight', dpi=300)
-plt.show()
+for fold, (train_idx, val_idx) in enumerate(kf.split(X, y_log), 1):
+    X_tr, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
+    y_tr_log, y_val_log = y_log[train_idx], y_log[val_idx]
+    y_tr_real, y_val_real = y[train_idx], y[val_idx]
 
-# ==============================================================================
-# REKORD 1: BMW SERII 5 530i LUXURY LINE (BIAŁA - 2022)
-# ==============================================================================
-cena_1 = 147000
-rocznik_1 = 2022
-wiek_1 = AKTUALNY_ROK - rocznik_1
-przebieg_1 = 92000
-moc_1 = 252
-pojemnosc_1 = 1998
+    sredni_przebieg_rocznika = X_tr.groupby('Rocznik')['Przebieg'].mean().to_dict()
+    glob_przebieg = X_tr['Przebieg'].mean()
+    X_tr['Odchylenie_Przebiegu'] = X_tr['Przebieg'] - X_tr['Rocznik'].map(sredni_przebieg_rocznika).fillna(glob_przebieg)
+    X_val['Odchylenie_Przebiegu'] = X_val['Przebieg'] - X_val['Rocznik'].map(sredni_przebieg_rocznika).fillna(glob_przebieg)
 
-przebieg_roczny_1 = przebieg_1 / (wiek_1 + 0.5)
-moc_z_pojemnosci_1 = moc_1 / (pojemnosc_1 + 1)
+    srednia_moc_serii = X_tr.groupby('Seria_Main')['Moc'].mean().to_dict()
+    glob_moc = X_tr['Moc'].mean()
+    X_tr['Stosunek_Mocy_Do_Serii'] = X_tr['Moc'] / X_tr['Seria_Main'].map(srednia_moc_serii).fillna(glob_moc)
+    X_val['Stosunek_Mocy_Do_Serii'] = X_val['Moc'] / X_val['Seria_Main'].map(srednia_moc_serii).fillna(glob_moc)
 
-input_1_pre = pd.DataFrame({'Wiek': [wiek_1], 'Moc': [moc_1], 'Pojemność': [pojemnosc_1], 'Przebieg': [przebieg_1], 'Przebieg_Roczny': [przebieg_roczny_1], 'Moc_Z_Pojemnosci': [moc_z_pojemnosci_1]})
-is_anomaly_1 = 1 if iso_forest.predict(input_1_pre[features_for_anomaly])[0] == -1 else 0
+    q_low, q_high = np.percentile(y_tr_real, 1), np.percentile(y_tr_real, 99)
+    mask_quantile = (y_tr_real >= q_low) & (y_tr_real <= q_high)
 
-input_data_1 = pd.DataFrame({
-    'Typ sprzedawcy': ['Osoba prywatna'], 'Kraj pochodzenia': ['Polska'], 'Typ skrzyni': ['Automatyczna'], 'Typ nadwozia': ['Sedan'], 'Typ paliwa': ['Benzyna'],
-    'Generacja': ['G30/G31 (2016-2023)'], 'Seria/Model': ['Seria 5'], 'Stan': ['Używane'], 'Seria_Main': ['Seria'],
-    'Wiek': [wiek_1], 'Moc': [moc_1], 'Pojemność': [pojemnosc_1], 'Przebieg': [przebieg_1], 'Is_M_Power': [0],
-    'Przebieg_Roczny': [przebieg_roczny_1], 'Moc_Z_Pojemnosci': [moc_z_pojemnosci_1], 'Is_Anomaly': [is_anomaly_1]
-})[features]
+    iso = IsolationForest(contamination=0.02, random_state=42)
+    iso.fit(X_tr[features_for_anomaly])
+    mask_iso = (iso.predict(X_tr[features_for_anomaly]) == 1)
 
-wycena_1_pln = np.exp(model.predict(input_data_1)[0])
+    final_tr_mask = mask_quantile & mask_iso
+    features_final = features_base + ['Odchylenie_Przebiegu', 'Stosunek_Mocy_Do_Serii']
 
-print(f"\n==============================================================================")
-print(f"--- REKORD 1: BMW Seria 5 530i Luxury Line (Rocznik 2022) ---")
-print(f"==============================================================================")
-print(f"-> Cena z ogłoszenia:  {cena_1:,.2f} PLN")
-print(f"-> Wycena modelu:      {wycena_1_pln:,.2f} PLN")
-roznica_1 = ((wycena_1_pln - cena_1) / cena_1) * 100
-print(f"-> Różnica:            {roznica_1:.2f}% (Model uważa za: {'OKAZJĘ' if roznica_1 > 0 else 'ZAWYŻONE'})")
-print(f"-> Status anomalii IF: {'Wykryto odchylenie (Outlier)' if is_anomaly_1 == 1 else 'Normalny profil rynkowy'}")
+    X_tr_clean = X_tr.loc[final_tr_mask, features_final]
+    y_tr_log_clean = y_tr_log[final_tr_mask]
+    y_tr_real_clean = y_tr_real[final_tr_mask]
 
-bylo_w_train_1 = X_train[(X_train['Wiek'] == wiek_1) & (X_train['Przebieg'] == przebieg_1) & (X_train['Moc'] == moc_1)]
-if len(bylo_w_train_1) > 0:
-    print(f"-> [WERYFIKACJA]: Wykryto to auto w zbiorze TRENINGOWYM ({len(bylo_w_train_1)} szt.).")
-else:
-    print(f"-> [WERYFIKACJA]: Brak w zbiorze treningowym. Predykcja jest w 100% czysta!")
+# Inicjalizacja modelu z optymalną regularyzacją anty-overfittingową
+    cb = CatBoostRegressor(
+        iterations=1500,           # Stabilna liczba drzew
+        depth=6,                   # Bezpieczniejsza głębokość drzewa (zapobiega zapamiętywaniu)
+        learning_rate=0.03,        # Wolne, precyzyjne dopasowywanie
+        l2_leaf_reg=7.0,           # Podwyższona kara L2 w liściach
+        random_strength=1.0,       # Wyższa losowość przy wybieraniu punktów podziału
+        subsample=0.8,             # Każde drzewo widzi 80% losowych wierszy z treningu
+        cat_features=cat_features,
+        logging_level='Silent',
+        random_seed=42
+    )
 
+    # Czyste dopasowanie WYŁĄCZNIE na zbiorze treningowym fałdy (brak Data Leakage)
+    cb.fit(
+        X_tr_clean,
+        y_tr_log_clean
+    )
 
-# ==============================================================================
-# REKORD 2: BMW SERII 5 530i M SPORT (GRAFITOWA ZE KIEROWNICĄ - 2019)
-# ==============================================================================
-cena_2 = 103000
-rocznik_2 = 2019
-wiek_2 = AKTUALNY_ROK - rocznik_2
-przebieg_2 = 197500
-moc_2 = 252
-pojemnosc_2 = 1998
+    pred_tr_real = np.exp(cb.predict(X_tr_clean))
+    pred_val_real = np.exp(cb.predict(X_val[features_final]))
 
-przebieg_roczny_2 = przebieg_2 / (wiek_2 + 0.5)
-moc_z_pojemnosci_2 = moc_2 / (pojemnosc_2 + 1)
+    metrics['Train_MAPE'].append(mean_absolute_percentage_error(y_tr_real_clean, pred_tr_real))
+    metrics['Val_MAPE'].append(mean_absolute_percentage_error(y_val_real, pred_val_real))
+    metrics['Train_R2'].append(r2_score(y_tr_real_clean, pred_tr_real))
+    metrics['Val_R2'].append(r2_score(y_val_real, pred_val_real))
+    metrics['Val_MAE'].append(mean_absolute_error(y_val_real, pred_val_real))
+    metrics['Val_RMSE'].append(np.sqrt(mean_squared_error(y_val_real, pred_val_real)))
 
-input_2_pre = pd.DataFrame({'Wiek': [wiek_2], 'Moc': [moc_2], 'Pojemność': [pojemnosc_2], 'Przebieg': [przebieg_2], 'Przebieg_Roczny': [przebieg_roczny_2], 'Moc_Z_Pojemnosci': [moc_z_pojemnosci_2]})
-is_anomaly_2 = 1 if iso_forest.predict(input_2_pre[features_for_anomaly])[0] == -1 else 0
+    print(f"Fałda {fold}/5 | Train MAPE: {metrics['Train_MAPE'][-1]:.2%} | Val MAPE: {metrics['Val_MAPE'][-1]:.2%} | Val R2: {metrics['Val_R2'][-1]:.4f}")
 
-input_data_2 = pd.DataFrame({
-    'Typ sprzedawcy': ['Osoba prywatna'], 'Kraj pochodzenia': ['Polska'], 'Typ skrzyni': ['Automatyczna'], 'Typ nadwozia': ['Sedan'], 'Typ paliwa': ['Benzyna'],
-    'Generacja': ['G30/G31 (2016-2023)'], 'Seria/Model': ['Seria 5'], 'Stan': ['Używane'], 'Seria_Main': ['Seria'],
-    'Wiek': [wiek_2], 'Moc': [moc_2], 'Pojemność': [pojemnosc_2], 'Przebieg': [przebieg_2], 'Is_M_Power': [0],
-    'Przebieg_Roczny': [przebieg_roczny_2], 'Moc_Z_Pojemnosci': [moc_z_pojemnosci_2], 'Is_Anomaly': [is_anomaly_2]
-})[features]
-
-wycena_2_pln = np.exp(model.predict(input_data_2)[0])
-
-print(f"\n==============================================================================")
-print(f"--- REKORD 2: BMW Seria 5 530i M Sport (Rocznik 2019) ---")
-print(f"==============================================================================")
-print(f"-> Cena z ogłoszenia:  {cena_2:,.2f} PLN")
-print(f"-> Wycena modelu:      {wycena_2_pln:,.2f} PLN")
-roznica_2 = ((wycena_2_pln - cena_2) / cena_2) * 100
-print(f"-> Różnica:            {roznica_2:.2f}% (Model uważa za: {'OKAZJĘ' if roznica_2 > 0 else 'ZAWYŻONE'})")
-print(f"-> Status anomalii IF: {'Wykryto odchylenie (Outlier)' if is_anomaly_2 == 1 else 'Normalny profil rynkowy'}")
-
-bylo_w_train_2 = X_train[(X_train['Wiek'] == wiek_2) & (X_train['Przebieg'] == przebieg_2) & (X_train['Moc'] == moc_2)]
-if len(bylo_w_train_2) > 0:
-    print(f"-> [WERYFIKACJA]: Wykryto to auto w zbiorze TRENINGOWYM ({len(bylo_w_train_2)} szt.).")
-else:
-    print(f"-> [WERYFIKACJA]: Brak w zbiorze treningowym. Predykcja jest w 100% czysta!")
-print("==============================================================================")
+print("\n--- PODSUMOWANIE CATBOOST ---")
+print(f"Średni Train MAPE: {np.mean(metrics['Train_MAPE']):.2%}")
+print(f"Średni Val MAPE:   {np.mean(metrics['Val_MAPE']):.2%}")
+print(f"Średni Train R2:   {np.mean(metrics['Train_R2']):.4f}")
+print(f"Średni Val R2:     {np.mean(metrics['Val_R2']):.4f}")
+print(f"Średni Val MAE:    {np.mean(metrics['Val_MAE']):,.2f} PLN")
+print(f"Średni Val RMSE:   {np.mean(metrics['Val_RMSE']):,.2f} PLN")
